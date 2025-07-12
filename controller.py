@@ -14,16 +14,11 @@ import pandas as pd
 IDLE_TIMEOUT_FOR_STATS = 2 
 DEFAULT_FLOW_PRIORITY = 1
 ATTACK_BLOCK_PRIORITY = 10
-MODEL_PATH = r'D:\môn học\DACN\DA\xgb_sdn_model_clean.pkl'
+MODEL_PATH = r'xgb_sdn_model_clean.pkl'
 
-MONITORING_INTERVAL = 30.0 
-MAX_SWITCHES = 10  
-MAX_PORTS_PER_SWITCH = 5 
-
-# --- Phát hiện tấn công ---
-DETECTION_MIN_PACKETS = 10  # Số gói tin tối thiểu
-DETECTION_MIN_DURATION = 1.0  # Thời gian tối thiểu
-DETECTION_INTERVAL = 5.0  # Khoảng thời gian giữa các lần
+DETECTION_MIN_PACKETS = 10  
+DETECTION_MIN_DURATION = 1.0  
+DETECTION_INTERVAL = 5.0  
 
 class SDN_IDPS(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -31,13 +26,13 @@ class SDN_IDPS(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SDN_IDPS, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
-        self.flows = {} # Key:(src_ip, dst_ip, protocol).
+        self.flows = {} 
         self.datapaths = {}
         self.monitor_thread = hub.spawn(self._monitor)
-        self.active_flows_per_switch = {}  # {datapath_id: count}
+        self.active_flows_per_switch = {}  
         self.last_analysis_time = {}  # {flow_key: timestamp} để tránh phân tích quá thường xuyên
-        self.early_detection_stats = {'analyzed': 0, 'detected': 0, 'blocked': 0}  # Thống kê phát hiện sớm
-        self.blocked_ips = set()  # Tập hợp các IP đã bị chặn
+        self.early_detection_stats = {'analyzed': 0, 'detected': 0, 'blocked': 0} 
+        self.blocked_ips = set()
 
         self.model = None
         self.scaler = None
@@ -53,21 +48,19 @@ class SDN_IDPS(app_manager.RyuApp):
             self.model_metrics = model_package['metrics']
             self.label_encoders = model_package.get('label_encoders', {})            
             self.logger.info("✅ Load mô hình XGBoost thành công!")
-        except Exception:
-            self.logger.error(f"❌ Không thể load mô hình!")
+        except Exception as e:
+            self.logger.error(f"❌ Không thể load mô hình: {str(e)}")
 
     def _monitor(self):
         while True:
             for dp in list(self.datapaths.values()):
                 self._request_stats(dp)
             
-            # Phân tích real-time các flow đang hoạt động để phát hiện tấn công sớm
             self._analyze_active_flows()
             
             hub.sleep(7)
 
     def _request_stats(self, datapath):
-        # Gửi yêu cầu thống kê chung.
         self.logger.debug('Gửi yêu cầu thống kê đến switch: %016x', datapath.id)
         parser = datapath.ofproto_parser
         req_flow = parser.OFPFlowStatsRequest(datapath)
@@ -76,9 +69,6 @@ class SDN_IDPS(app_manager.RyuApp):
         datapath.send_msg(req_port)
 
     def _analyze_active_flows(self):
-        """
-        Phân tích real-time các flow đang hoạt động để phát hiện tấn công sớm
-        """
         if not self.model or not self.scaler:
             return
 
@@ -87,56 +77,44 @@ class SDN_IDPS(app_manager.RyuApp):
 
         # Tìm các flow có đủ điều kiện để phân tích sớm
         for flow_key, flow_data in self.flows.items():
-            # Kiểm tra điều kiện phân tích sớm
             if self._should_analyze_flow_early(flow_key, flow_data, current_time):
                 flows_to_analyze.append((flow_key, flow_data))
 
-        # Phân tích các flow được chọn
         for flow_key, flow_data in flows_to_analyze:
             self._analyze_single_flow_early(flow_key, flow_data, current_time)
 
     def _should_analyze_flow_early(self, flow_key, flow_data, current_time):
-        """
-        Kiểm tra xem flow có nên được phân tích sớm hay không
-        """
-
         src_ip, dst_ip, protocol = flow_key
         if src_ip in self.blocked_ips:
             return False
 
-        # Kiểm tra số gói tin tối thiểu
         if flow_data['packet_count'] < DETECTION_MIN_PACKETS:
             return False
 
-        # Kiểm tra thời gian tối thiểu
         duration = current_time - flow_data['start_time']
         if duration < DETECTION_MIN_DURATION:
             return False
 
-        # Kiểm tra khoảng thời gian giữa các lần phân tích
         last_analysis = self.last_analysis_time.get(flow_key, 0)
         if current_time - last_analysis < DETECTION_INTERVAL:
             return False
 
-        # Kiểm tra flow chưa bị chặn
         if flow_data.get('is_blocked', False):
             return False
 
-        # Chỉ phân tích chiều bắt đầu trước cho mọi giao thức
+        # Chỉ phân tích chiều bắt đầu trước cho giao thức 2 chiều
         if protocol == 6 or protocol == 1:
             reverse_key = self.get_reverse_flow_key(*flow_key)
             reverse_flow = self.flows.get(reverse_key)
             if reverse_flow and reverse_flow['start_time'] < flow_data['start_time']:
-                return False  # flow này đến sau, bỏ qua
+                return False
 
         return True
 
     def _analyze_single_flow_early(self, flow_key, flow_data, current_time):
         try:
-            # Cập nhật thời gian phân tích cuối
             self.last_analysis_time[flow_key] = current_time
 
-            # Tính số flow hiện tại trên switch (ước tính)
             flows_count = len(self.flows)
 
             features_df = self.extract_features(flow_data, flows_count=flows_count)
@@ -226,14 +204,12 @@ class SDN_IDPS(app_manager.RyuApp):
         flow_groups = {}
         
         for stat in [flow for flow in body if flow.priority == 1]:
-            # Lấy thông tin IP từ match fields
             src_ip = stat.match.get('ipv4_src')
             dst_ip = stat.match.get('ipv4_dst')
             protocol = stat.match.get('ip_proto')
             
             # Chỉ xử lý flow có thông tin IP
             if src_ip and dst_ip and protocol is not None:
-                # Tạo key nhóm
                 group_key = (src_ip, dst_ip, protocol)
                 
                 if group_key not in flow_groups:
@@ -244,26 +220,22 @@ class SDN_IDPS(app_manager.RyuApp):
                         'total_packets': 0,
                         'total_bytes': 0,
                         'flow_count': 0,
-                        'ports': set()  # Tập hợp các port được sử dụng
+                        'ports': set()  
                     }
                 
-                # Cộng dồn thống kê
                 flow_groups[group_key]['total_packets'] += stat.packet_count
                 flow_groups[group_key]['total_bytes'] += stat.byte_count
                 flow_groups[group_key]['flow_count'] += 1
                 
-                # Thêm port vào tập hợp
                 in_port = stat.match.get('in_port')
                 if in_port is not None:
                     flow_groups[group_key]['ports'].add(in_port)
         
-        # Hiển thị thống kê gom nhóm
         if flow_groups:
             self.logger.info('=== FLOW STATISTICS (GROUPED BY SRC/DST IP) ===')
             self.logger.info('datapath         src_ip          dst_ip          protocol  flows  packets    bytes    ports')
             self.logger.info('---------------- --------------- --------------- --------  -----  --------  --------  -----')
             
-            # Sắp xếp theo tổng số packets (giảm dần)
             sorted_groups = sorted(flow_groups.items(), 
                                  key=lambda x: x[1]['total_packets'], reverse=True)
             
@@ -280,7 +252,6 @@ class SDN_IDPS(app_manager.RyuApp):
                                 group_data['total_bytes'],
                                 ports_str)
             
-            # Thống kê tổng quan
             total_groups = len(flow_groups)
             total_flows = sum(g['flow_count'] for g in flow_groups.values())
             total_packets = sum(g['total_packets'] for g in flow_groups.values())
@@ -319,14 +290,13 @@ class SDN_IDPS(app_manager.RyuApp):
         self.add_flow(datapath, 0, match, actions)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0, hard_timeout=0, flags=0):
-        # Hàm tiện ích thêm flow rule. Các tham số idle_timeout và flags rất quan trọng cho IDPS.
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod_args = {
             'datapath': datapath, 'priority': priority, 'match': match,
-            'instructions': inst, 'idle_timeout': idle_timeout, # Timeout để kích hoạt FlowRemoved.
-            'hard_timeout': hard_timeout, 'flags': flags # Cờ OFPFF_SEND_FLOW_REM để nhận sự kiện.
+            'instructions': inst, 'idle_timeout': idle_timeout, 
+            'hard_timeout': hard_timeout, 'flags': flags 
         }
         if buffer_id and buffer_id != ofproto.OFP_NO_BUFFER:
              mod_args['buffer_id'] = buffer_id
@@ -335,9 +305,8 @@ class SDN_IDPS(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        # Kiểm tra model và scaler trước khi xử lý cho IDPS.
         if not self.model or not self.scaler:
-            self.logger.warning("IDPS: Model/Scaler chưa tải, bỏ qua xử lý PacketIn cho IDPS.")
+            self.logger.warning("IDPS: Model/Scaler chưa tải, bỏ qua xử lý PacketIn")
             return
 
         msg = ev.msg
@@ -381,19 +350,16 @@ class SDN_IDPS(app_manager.RyuApp):
                 self.active_flows_per_switch.setdefault(dpid_num, 0)
                 self.active_flows_per_switch[dpid_num] += 1
 
-                # Cài đặt flow rule tạm thời để thu thập thống kê và kích hoạt FlowRemoved.
                 match_fields_dict = {'eth_type': ether_types.ETH_TYPE_IP, 'ipv4_src': src_ip, 'ipv4_dst': dst_ip, 'ip_proto': protocol}
                 if tcp_pkt: match_fields_dict.update({'tcp_src': src_port, 'tcp_dst': dst_port})
                 elif udp_pkt: match_fields_dict.update({'udp_src': src_port, 'udp_dst': dst_port})
                 match_for_flow_rule = parser.OFPMatch(**match_fields_dict)
 
-                # Thêm flow rule với idle_timeout và cờ OFPFF_SEND_FLOW_REM.
                 self.add_flow(datapath, DEFAULT_FLOW_PRIORITY, match_for_flow_rule, actions_packet_out,
                                 msg.buffer_id if msg.buffer_id != ofproto.OFP_NO_BUFFER else None,
-                                idle_timeout=IDLE_TIMEOUT_FOR_STATS, # Quan trọng cho việc kích hoạt FlowRemoved.
-                                flags=ofproto.OFPFF_SEND_FLOW_REM)   # Quan trọng để nhận sự kiện.
+                                idle_timeout=IDLE_TIMEOUT_FOR_STATS, 
+                                flags=ofproto.OFPFF_SEND_FLOW_REM)  
         
-        # Gửi gói tin PacketIn hiện tại ra ngoài.
         data_to_send = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
         out_message = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                           in_port=in_port, actions=actions_packet_out, data=data_to_send)
@@ -401,9 +367,6 @@ class SDN_IDPS(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
     def _flow_removed_handler(self, ev):
-        """
-        Khi xóa flow, ghi log thông tin flow bị xóa.
-        """
         msg = ev.msg
         datapath = msg.datapath
         match_fields = msg.match
@@ -421,28 +384,20 @@ class SDN_IDPS(app_manager.RyuApp):
             self.active_flows_per_switch[dpid_num] -= 1
 
     def get_flow_key(self, src_ip, dst_ip, protocol):
-        # Tạo key chỉ dựa trên src_ip, dst_ip, protocol để gom các flow theo đúng dataset
         return (src_ip, dst_ip, protocol)
 
     def get_reverse_flow_key(self, src_ip, dst_ip, protocol):
-        # Tạo key cho flow ngược lại
         return (dst_ip, src_ip, protocol)
 
     def check_pairflow(self, flow_key):
         """
-        Kiểm tra xem có paired flow (bidirectional) hay không
-        Returns: 1 nếu có paired flow, 0 nếu không
+        Kiểm tra paired flow (bidirectional) 
         """
         src_ip, dst_ip, protocol = flow_key
         reverse_key = self.get_reverse_flow_key(src_ip, dst_ip, protocol)
         return 1 if reverse_key in self.flows else 0
 
     def update_flow(self, flow_key, now, packet_length, tcp_pkt, ipv4_pkt, in_port=None):
-        """
-        Cập nhật thông tin thống kê cho flow theo chuẩn dataset SDN.
-        Lưu trữ đầy đủ thông tin để tính toán 23 features.
-        """
-        # Lấy thông tin port từ flow_key để lưu vào flow_stats
         src_ip, dst_ip, protocol_info = flow_key
         
         flow_stats = self.flows.setdefault(flow_key, {
@@ -451,18 +406,16 @@ class SDN_IDPS(app_manager.RyuApp):
             'packet_lengths': [],
             'packet_count': 0,
             'total_bytes': 0,
-            # Thông tin cơ bản cho features
             'src_ip': src_ip,
             'dst_ip': dst_ip,
             'protocol': protocol_info,
             'in_port': in_port,
             'is_blocked': False,
-            # Thông tin bổ sung cho tính toán chính xác
             'first_packet_time': now,
             'last_packet_time': now,
-            'tx_bytes': 0,  # Bytes truyền
-            'rx_bytes': 0,  # Bytes nhận
-            'packet_ins_count': 0,  # Số lượng Packet_in messages
+            'tx_bytes': 0,  
+            'rx_bytes': 0,  
+            'packet_ins_count': 0,  
         })
 
         flow_stats['last_time'] = now
@@ -471,9 +424,8 @@ class SDN_IDPS(app_manager.RyuApp):
         flow_stats['packet_lengths'].append(packet_length)
         flow_stats['packet_count'] += 1
         flow_stats['total_bytes'] += packet_length
-        flow_stats['packet_ins_count'] += 1  # Mỗi packet tạo ra một Packet_in
+        flow_stats['packet_ins_count'] += 1  
 
-        # Tính toán tx_bytes và rx_bytes (đơn giản: chia đôi)
         flow_stats['tx_bytes'] = flow_stats['total_bytes'] // 2
         flow_stats['rx_bytes'] = flow_stats['total_bytes'] - flow_stats['tx_bytes'] 
 
@@ -482,7 +434,7 @@ class SDN_IDPS(app_manager.RyuApp):
         if duration <= 0: duration = 1e-6   
 
         if datapath_id is not None:
-            switch_id = datapath_id % MAX_SWITCHES 
+            switch_id = datapath_id 
         else:
             switch_id = 0
         
@@ -509,7 +461,6 @@ class SDN_IDPS(app_manager.RyuApp):
             except:
                 src = 0
         
-        # 8. Destination IP: IP đích (encoded)
         dst_ip = flow_data_dict.get('dst_ip', '10.0.0.8')
         if self.label_encoders and 'dst' in self.label_encoders:
             try:
@@ -523,7 +474,6 @@ class SDN_IDPS(app_manager.RyuApp):
             except:
                 dst = 16
         
-        # 9. Port number: Số hiệu cổng switch
         port_no_raw = flow_data_dict.get('in_port', 1)
         if self.label_encoders and 'port_no' in self.label_encoders:
             try:
@@ -533,40 +483,28 @@ class SDN_IDPS(app_manager.RyuApp):
         else:
             port_no = (port_no_raw - 1) % 5
         
-        # 10. tx_bytes: Bytes truyền từ switch port
         tx_bytes = flow_data_dict.get('tx_bytes', bytecount // 2)
         
-        # 11. rx_bytes: Bytes nhận trên switch port
         rx_bytes = flow_data_dict.get('rx_bytes', bytecount - tx_bytes)
         
-        # --- CALCULATED FEATURES (tính toán) ---
         
-        # 14. Byte per flow: Số bytes trong một flow
         byteperflow = bytecount
         
-        # 16. Packet_ins: Số lượng Packet_in messages
-        packetins = flow_data_dict.get('packet_ins_count', pktcount)  # Sử dụng giá trị đã lưu trữ
+        packetins = flow_data_dict.get('packet_ins_count', pktcount)  
         
-        # 17. Total flow entries: Tổng số flow entries trong switch
         flows = flows_count
         
-        # 19. rx_kbps: Tốc độ nhận dữ liệu (Kbps)
         rx_kbps = (rx_bytes * 8 / 1000) / duration if duration > 0 else 0
-        
-        # 20. Port Bandwidth: Tổng băng thông cổng (tx_kbps + rx_kbps)
-        port_bandwidth = rx_kbps  # Chỉ còn rx_kbps
-        
-        # 21. Pairflow: Kiểm tra có flow ngược lại không
+                
         flow_key = (flow_data_dict.get('src_ip', ''), flow_data_dict.get('dst_ip', ''), flow_data_dict.get('protocol', 0))
         Pairflow = self.check_pairflow(flow_key)
         
-        # 22. Protocol: Loại giao thức (encoded)
         protocol_raw = flow_data_dict.get('protocol', 17)
-        if protocol_raw == 6:      # TCP
+        if protocol_raw == 6:      
             protocol_name = 'TCP'
-        elif protocol_raw == 17:   # UDP  
+        elif protocol_raw == 17:   
             protocol_name = 'UDP'
-        elif protocol_raw == 1:    # ICMP
+        elif protocol_raw == 1:    
             protocol_name = 'ICMP'
         else:
             protocol_name = 'UDP'
@@ -586,12 +524,9 @@ class SDN_IDPS(app_manager.RyuApp):
             else:
                 Protocol = 2
         
-        # 23. Total kbps: Tổng tốc độ truyền nhận
         tot_kbps = (bytecount * 8 / 1000) / duration if duration > 0 else 0
 
-        # --- Tạo DataFrame với đúng thứ tự features từ model ---
         if self.feature_columns:
-            # Sử dụng thứ tự features từ model đã train
             feature_values = []
             for feature in self.feature_columns:
                 if feature == 'switch':
@@ -631,11 +566,10 @@ class SDN_IDPS(app_manager.RyuApp):
                 elif feature == 'tot_kbps':
                     feature_values.append(tot_kbps)
                 else:
-                    feature_values.append(0)  # Default value for unknown features
+                    feature_values.append(0)  
             
             features_df = pd.DataFrame([feature_values], columns=self.feature_columns)
         else:
-            # Fallback nếu không có feature_columns - sử dụng thứ tự theo mô tả dataset
             self.logger.warning("IDPS: Không có feature_columns từ model, sử dụng thứ tự theo mô tả dataset")
             feature_names = [
                 'switch', 'src', 'dst', 'pktcount', 'bytecount', 'dur', 'dur_nsec', 'tot_dur',
