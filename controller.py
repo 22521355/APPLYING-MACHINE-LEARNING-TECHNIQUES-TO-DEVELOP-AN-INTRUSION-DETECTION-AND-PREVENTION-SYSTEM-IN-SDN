@@ -14,7 +14,7 @@ import pandas as pd
 IDLE_TIMEOUT_FOR_STATS = 2 
 DEFAULT_FLOW_PRIORITY = 1
 ATTACK_BLOCK_PRIORITY = 10
-MODEL_PATH = r'xgb_sdn_model_clean.pkl'
+MODEL_PATH = r'xgboost.pkl'
 
 DETECTION_MIN_PACKETS = 10  
 DETECTION_MIN_DURATION = 1.0  
